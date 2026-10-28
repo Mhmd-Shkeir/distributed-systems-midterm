@@ -29,8 +29,13 @@ services:
     command: ["uvicorn", "metadata.app:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       DATABASE_URL: postgresql://dfs:dfs@postgres:5432/dfs
-      REPLICATION_FACTOR: "1"
+      REPLICATION_FACTOR: "3"      # default durability: 3 full copies
+      EC_K: "2"                    # erasure coding option: 2 data + 2 parity shards
+      EC_M: "2"
       VNODES: "128"
+      DEAD_AFTER: "15"             # seconds without a heartbeat before a node counts as failed
+      REPAIR_INTERVAL: "10"        # automatic repair pass
+      SCRUB_INTERVAL: "300"        # periodic scrub of every node's disk
     ports: ["8000:8000"]
     depends_on:
       postgres: {condition: service_healthy}
@@ -59,6 +64,15 @@ services:
     ports: ["8104:8080"]
     volumes: ["node4-data:/data"]
 
+  # Fifth node, only started for the scale-out test:
+  #   docker compose --profile scale up -d node5
+  node5:
+    <<: *node
+    profiles: ["scale"]
+    environment: {<<: *node-env, NODE_ID: node5, PUBLIC_ADDR: "http://node5:8080"}
+    ports: ["8105:8080"]
+    volumes: ["node5-data:/data"]
+
 # One named volume per node = each node has its own separate local disk.
 volumes:
   pg-data:
@@ -66,3 +80,4 @@ volumes:
   node2-data:
   node3-data:
   node4-data:
+  node5-data:

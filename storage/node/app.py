@@ -17,6 +17,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
 
 NODE_ID = os.environ.get("NODE_ID", "node-unknown")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
@@ -153,6 +154,38 @@ async def delete_chunk(chunk_hash: str):
         raise HTTPException(404, "chunk not found")
     state.chunk_count -= 1
     return Response(status_code=204)
+
+
+def _scrub() -> dict:
+    """Re-hash every stored chunk; quarantine the ones that no longer match."""
+    checked = nbytes = 0
+    ok: list[str] = []
+    corrupted: list[str] = []
+    for path in CHUNK_DIR.rglob("*"):
+        if not (path.is_file() and HASH_RE.match(path.name)):
+            continue
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            continue  # deleted while scrubbing
+        checked += 1
+        nbytes += len(data)
+        if hashlib.sha256(data).hexdigest() == path.name:
+            ok.append(path.name)
+        else:
+            log.error("scrub: chunk %s is corrupted; quarantining", path.name)
+            try:
+                os.replace(path, QUARANTINE_DIR / f"{path.name}.{int(time.time())}")
+            except FileNotFoundError:
+                pass
+            corrupted.append(path.name)
+    state.chunk_count = len(ok)
+    return {"node_id": NODE_ID, "checked": checked, "bytes": nbytes, "corrupted": corrupted, "hashes": ok}
+
+
+@app.post("/scrub")
+async def scrub():
+    return await run_in_threadpool(_scrub)
 
 
 @app.get("/health")

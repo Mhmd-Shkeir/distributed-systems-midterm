@@ -1,187 +1,73 @@
-"""Metadata and placement service.
+"""Metadata, placement and gateway service with an S3-like REST API.
 
-* Receives heartbeats from storage nodes (registers them on the hash ring).
-* Splits uploaded objects into chunks (fixed-size or content-defined).
-* Places each new chunk on the node(s) chosen by a consistent hash ring.
-* Keeps object metadata, chunk reference counts and chunk locations in Postgres.
-* Deduplicates at chunk level: a chunk that already exists is not stored again,
-  only its reference count is incremented. A chunk is removed from the nodes
-  once no object references it any more.
+S3-style (path-style) endpoints: buckets, PUT/GET/HEAD/DELETE object, ListObjectsV2
+(prefix, delimiter, max-keys, continuation-token), Range reads, ETag, user metadata
+(x-amz-meta-*). Responses are JSON rather than XML and there is no request signing.
+Extra: /search, and /admin/* for cluster status, repair, scrub and rebalancing.
 """
 import asyncio
-import hashlib
+import json
 import logging
-import os
 import random
+import re
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
+from email.utils import format_datetime
 
-import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
 from pydantic import BaseModel
 
-from . import chunking
-from .ring import HashRing
-
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://dfs:dfs@postgres:5432/dfs")
-REPLICATION_FACTOR = int(os.environ.get("REPLICATION_FACTOR", "1"))
-VNODES = int(os.environ.get("VNODES", "128"))
-DEAD_AFTER = float(os.environ.get("DEAD_AFTER", "15"))
-MAX_OBJECT_BYTES = int(os.environ.get("MAX_OBJECT_BYTES", str(256 * 1024 * 1024)))
-GC_INTERVAL = float(os.environ.get("GC_INTERVAL", "30"))
+from . import config, maintenance, nodes, store
+from .db import init_schema, pool
+from .nodes import ring
 
 log = logging.getLogger("metadata")
 logging.basicConfig(level=logging.INFO)
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS nodes (
-    node_id     text PRIMARY KEY,
-    address     text NOT NULL,
-    free_bytes  bigint NOT NULL,
-    chunk_count integer NOT NULL,
-    reported_at double precision NOT NULL,
-    last_seen   timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS objects (
-    id          bigserial PRIMARY KEY,
-    name        text NOT NULL UNIQUE,
-    size        bigint NOT NULL,
-    sha256      text NOT NULL,
-    chunking    text NOT NULL,
-    chunk_count integer NOT NULL,
-    created_at  timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS chunks (
-    hash     text PRIMARY KEY,
-    size     integer NOT NULL,
-    refcount integer NOT NULL CHECK (refcount >= 0)
-);
-CREATE TABLE IF NOT EXISTS chunk_locations (
-    hash    text NOT NULL REFERENCES chunks(hash) ON DELETE CASCADE,
-    node_id text NOT NULL,
-    PRIMARY KEY (hash, node_id)
-);
-CREATE TABLE IF NOT EXISTS object_chunks (
-    object_id  bigint NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
-    seq        integer NOT NULL,
-    chunk_hash text NOT NULL REFERENCES chunks(hash),
-    PRIMARY KEY (object_id, seq)
-);
-CREATE INDEX IF NOT EXISTS object_chunks_hash ON object_chunks(chunk_hash);
--- Copies that must be removed from a node once no chunk row references them.
-CREATE TABLE IF NOT EXISTS gc_queue (
-    hash    text NOT NULL,
-    node_id text NOT NULL,
-    PRIMARY KEY (hash, node_id)
-);
-"""
-
-pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=16, open=False, kwargs={"row_factory": dict_row})
-http = httpx.Client(timeout=30.0)
-ring = HashRing(VNODES)
+RESERVED = {"admin", "nodes", "heartbeat", "search", "docs", "redoc", "openapi.json"}
+BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 
 
-def lock_hash(conn, chunk_hash: str):
-    """Serialise upload / delete / GC of one chunk (released at commit)."""
-    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (chunk_hash,))
-
-
-# ------------------------------------------------------------------ nodes
-
-def node_put(addr: str, h: str, data: bytes):
-    r = http.put(f"{addr}/chunks/{h}", content=data)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"PUT {addr} -> {r.status_code} {r.text}")
-
-
-def node_get(addr: str, h: str) -> bytes | None:
-    try:
-        r = http.get(f"{addr}/chunks/{h}")
-    except httpx.HTTPError:
-        return None
-    return r.content if r.status_code == 200 else None
-
-
-def node_delete(addr: str, h: str):
-    r = http.delete(f"{addr}/chunks/{h}")
-    if r.status_code not in (204, 404):
-        raise RuntimeError(f"DELETE {addr} -> {r.status_code}")
-
-
-def alive_nodes(conn) -> dict[str, str]:
-    rows = conn.execute(
-        "SELECT node_id, address FROM nodes WHERE last_seen > now() - make_interval(secs => %s)",
-        (DEAD_AFTER,),
-    ).fetchall()
-    return {r["node_id"]: r["address"] for r in rows}
-
-
-# ------------------------------------------------------------------ garbage collection
-
-def run_gc(limit: int = 500) -> int:
-    """Delete node copies that no chunk row references any more."""
-    with pool.connection() as conn:
-        todo = conn.execute("SELECT hash, node_id FROM gc_queue LIMIT %s", (limit,)).fetchall()
-    done = 0
-    for item in todo:
-        h, node_id = item["hash"], item["node_id"]
-        try:
-            with pool.connection() as conn:
-                lock_hash(conn, h)
-                # The chunk may have been uploaded again in the meantime.
-                in_use = conn.execute(
-                    "SELECT 1 FROM chunk_locations WHERE hash=%s AND node_id=%s", (h, node_id)
-                ).fetchone()
-                if not in_use:
-                    node = conn.execute("SELECT address FROM nodes WHERE node_id=%s", (node_id,)).fetchone()
-                    if node is None:
-                        raise RuntimeError(f"unknown node {node_id}")
-                    node_delete(node["address"], h)
-                conn.execute("DELETE FROM gc_queue WHERE hash=%s AND node_id=%s", (h, node_id))
-            done += 1
-        except Exception as exc:  # leave it queued, retry on the next pass
-            log.warning("gc of %s on %s failed: %s", h[:12], node_id, exc)
-    return done
-
-
-async def gc_loop():
+async def periodic(fn, interval: float, name: str):
     while True:
-        await asyncio.sleep(GC_INTERVAL)
+        await asyncio.sleep(interval)
         try:
-            await run_in_threadpool(run_gc)
+            await run_in_threadpool(fn)
         except Exception as exc:
-            log.warning("gc pass failed: %s", exc)
+            log.warning("%s pass failed: %s", name, exc)
 
-
-# ------------------------------------------------------------------ app
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     pool.open()
-    for attempt in range(30):
+    for _attempt in range(30):
         try:
+            init_schema()
             with pool.connection() as conn:
-                conn.execute(SCHEMA)
-                for r in conn.execute("SELECT node_id FROM nodes").fetchall():
-                    ring.add_node(r["node_id"])
+                nodes.load_ring(conn)
             break
         except Exception as exc:
             log.warning("waiting for database (%s)", exc)
             time.sleep(1)
     else:
         raise RuntimeError("database unavailable")
-    task = asyncio.create_task(gc_loop())
+    tasks = [
+        asyncio.create_task(periodic(maintenance.run_gc, config.GC_INTERVAL, "gc")),
+        asyncio.create_task(periodic(maintenance.repair_pass, config.REPAIR_INTERVAL, "repair")),
+        asyncio.create_task(periodic(maintenance.scrub_pass, config.SCRUB_INTERVAL, "scrub")),
+    ]
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
     pool.close()
 
 
-app = FastAPI(title="metadata-and-placement", lifespan=lifespan)
+app = FastAPI(title="Distributed object storage: metadata, placement and S3-like gateway", lifespan=lifespan)
 
+
+# ------------------------------------------------------------------ cluster membership
 
 class Heartbeat(BaseModel):
     node_id: str
@@ -194,16 +80,15 @@ class Heartbeat(BaseModel):
 @app.post("/heartbeat")
 def heartbeat(hb: Heartbeat):
     with pool.connection() as conn:
-        conn.execute(
+        row = conn.execute(
             """INSERT INTO nodes (node_id, address, free_bytes, chunk_count, reported_at, last_seen)
-               VALUES (%s, %s, %s, %s, %s, now())
-               ON CONFLICT (node_id) DO UPDATE SET address=EXCLUDED.address,
-                 free_bytes=EXCLUDED.free_bytes, chunk_count=EXCLUDED.chunk_count,
-                 reported_at=EXCLUDED.reported_at, last_seen=now()""",
-            (hb.node_id, hb.address, hb.free_bytes, hb.chunk_count, hb.timestamp),
-        )
-    if ring.add_node(hb.node_id):
-        log.info("node %s joined the ring", hb.node_id)
+               VALUES (%s,%s,%s,%s,%s, now())
+               ON CONFLICT (node_id) DO UPDATE SET address=EXCLUDED.address, free_bytes=EXCLUDED.free_bytes,
+                 chunk_count=EXCLUDED.chunk_count, reported_at=EXCLUDED.reported_at, last_seen=now()
+               RETURNING (xmax = 0) AS new, in_ring""",
+            (hb.node_id, hb.address, hb.free_bytes, hb.chunk_count, hb.timestamp)).fetchone()
+    if row["in_ring"] and ring.add_node(hb.node_id):
+        log.info("node %s joined the ring%s", hb.node_id, " (new node)" if row["new"] else "")
     return {"ok": True}
 
 
@@ -211,245 +96,138 @@ def heartbeat(hb: Heartbeat):
 def list_nodes():
     with pool.connection() as conn:
         rows = conn.execute(
-            "SELECT node_id, address, free_bytes, chunk_count, reported_at AS timestamp, "
-            "extract(epoch FROM now() - last_seen) AS age FROM nodes ORDER BY node_id"
-        ).fetchall()
+            "SELECT n.node_id, n.address, n.free_bytes, n.chunk_count, n.reported_at AS timestamp, n.in_ring, "
+            "extract(epoch FROM now() - n.last_seen) AS age, "
+            "(SELECT count(*) FROM chunk_locations l WHERE l.node_id = n.node_id) AS stored_pieces "
+            "FROM nodes n ORDER BY n.node_id").fetchall()
     return [
-        {
-            "node_id": r["node_id"], "address": r["address"], "free_bytes": r["free_bytes"],
-            "chunk_count": r["chunk_count"], "timestamp": r["timestamp"],
-            "age_seconds": round(r["age"], 1), "alive": r["age"] < DEAD_AFTER,
-        }
+        {"node_id": r["node_id"], "address": r["address"], "free_bytes": r["free_bytes"],
+         "chunk_count": r["chunk_count"], "timestamp": r["timestamp"], "in_ring": r["in_ring"],
+         "stored_pieces": r["stored_pieces"], "age_seconds": round(r["age"], 1), "alive": r["age"] < config.DEAD_AFTER}
         for r in rows
     ]
 
 
-# ------------------------------------------------------------------ objects
+# ------------------------------------------------------------------ admin
 
-def store_object(name: str, data: bytes, strategy: str, params: dict) -> dict:
-    try:
-        spans = chunking.split(data, strategy, **params)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
-    pieces = [data[s:e] for s, e in spans]
-    hashes = [hashlib.sha256(p).hexdigest() for p in pieces]
-    by_hash = dict(zip(hashes, pieces))
-    counts = Counter(hashes)
-    object_sha = hashlib.sha256(data).hexdigest()
-
-    placed: list[tuple[str, str]] = []  # (hash, node) copies written in this attempt
-    new_bytes = 0
-    try:
-        with pool.connection() as conn:
-            if conn.execute("SELECT 1 FROM objects WHERE name=%s", (name,)).fetchone():
-                raise HTTPException(409, f"object '{name}' already exists")
-            alive = alive_nodes(conn)
-            if not alive:
-                raise HTTPException(503, "no storage nodes are alive")
-
-            new_chunks = 0
-            for h in sorted(counts):  # fixed lock order avoids deadlocks
-                lock_hash(conn, h)
-                row = conn.execute(
-                    """INSERT INTO chunks (hash, size, refcount) VALUES (%s, %s, %s)
-                       ON CONFLICT (hash) DO UPDATE SET refcount = chunks.refcount + EXCLUDED.refcount
-                       RETURNING (xmax = 0) AS inserted""",
-                    (h, len(by_hash[h]), counts[h]),
-                ).fetchone()
-                if not row["inserted"]:
-                    continue  # deduplicated: only the reference count changed
-                targets = ring.lookup(h, REPLICATION_FACTOR, accept=lambda n: n in alive)
-                if not targets:
-                    raise HTTPException(503, "no storage nodes are alive")
-                for node_id in targets:
-                    try:
-                        node_put(alive[node_id], h, by_hash[h])
-                    except Exception as exc:
-                        raise HTTPException(502, f"storing chunk on {node_id} failed: {exc}")
-                    placed.append((h, node_id))
-                    conn.execute("INSERT INTO chunk_locations (hash, node_id) VALUES (%s, %s)", (h, node_id))
-                new_chunks += 1
-                new_bytes += len(by_hash[h])
-
-            obj = conn.execute(
-                "INSERT INTO objects (name, size, sha256, chunking, chunk_count) VALUES (%s,%s,%s,%s,%s) RETURNING id",
-                (name, len(data), object_sha, strategy, len(hashes)),
-            ).fetchone()
-            with conn.cursor() as cur:
-                cur.executemany(
-                    "INSERT INTO object_chunks (object_id, seq, chunk_hash) VALUES (%s, %s, %s)",
-                    [(obj["id"], i, h) for i, h in enumerate(hashes)],
-                )
-    except Exception:
-        if placed:  # the transaction rolled back: queue the copies for removal
-            with pool.connection() as conn:
-                with conn.cursor() as cur:
-                    cur.executemany(
-                        "INSERT INTO gc_queue (hash, node_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", placed
-                    )
-            run_gc()
-        raise
-
-    return {
-        "name": name, "size": len(data), "sha256": object_sha, "chunking": strategy,
-        "chunks": len(hashes), "unique_chunks": len(counts), "new_chunks": new_chunks,
-        "bytes_new": new_bytes, "bytes_deduplicated": len(data) - new_bytes,
-    }
+@app.get("/admin/config")
+def admin_config():
+    return {"replication_factor": config.REPLICATION_FACTOR, "ec": {"k": config.EC_K, "m": config.EC_M},
+            "default_durability": config.DEFAULT_DURABILITY, "default_chunking": config.DEFAULT_CHUNKING,
+            "chunk_size": config.CHUNK_SIZE, "vnodes_per_node": config.VNODES, "dead_after_seconds": config.DEAD_AFTER,
+            "repair_interval": config.REPAIR_INTERVAL, "scrub_interval": config.SCRUB_INTERVAL,
+            "ring_nodes": ring.nodes}
 
 
-@app.put("/objects/{name:path}", status_code=201)
-async def put_object(
-    name: str,
-    request: Request,
-    chunking_strategy: str = Query("fixed", alias="chunking", pattern="^(fixed|cdc)$"),
-    chunk_size: int = Query(4 * 1024 * 1024, ge=1024, description="fixed-size chunk bytes"),
-    cdc_min: int = Query(256 * 1024, ge=64),
-    cdc_avg: int = Query(1024 * 1024, ge=256),
-    cdc_max: int = Query(4 * 1024 * 1024, ge=1024),
-):
-    declared = request.headers.get("content-length")
-    if declared and int(declared) > MAX_OBJECT_BYTES:
-        raise HTTPException(413, "object too large")
-    data = await request.body()
-    if len(data) > MAX_OBJECT_BYTES:
-        raise HTTPException(413, "object too large")
-    if not data:
-        raise HTTPException(400, "empty object")
-    params = {"chunk_size": chunk_size, "min_size": cdc_min, "avg_size": cdc_avg, "max_size": cdc_max}
-    return await run_in_threadpool(store_object, name, data, chunking_strategy, params)
-
-
-def load_manifest(name: str) -> tuple[dict, list[dict]]:
+@app.get("/admin/status")
+def admin_status():
+    under = maintenance.under_protected()
     with pool.connection() as conn:
-        obj = conn.execute("SELECT * FROM objects WHERE name=%s", (name,)).fetchone()
-        if not obj:
-            raise HTTPException(404, "object not found")
+        n = conn.execute(
+            "SELECT count(*) AS total, count(*) FILTER (WHERE last_seen > now() - make_interval(secs => %s)) AS alive, "
+            "count(*) FILTER (WHERE in_ring) AS in_ring FROM nodes", (config.DEAD_AFTER,)).fetchone()
+        counts = conn.execute(
+            "SELECT (SELECT count(*) FROM objects) AS objects, (SELECT count(*) FROM chunks) AS chunks, "
+            "(SELECT count(*) FROM gc_queue) AS gc_queue").fetchone()
+        events = conn.execute("SELECT at, kind, chunk_hash, detail FROM repair_log ORDER BY id DESC LIMIT 10").fetchall()
+    for e in events:
+        e["at"] = e["at"].isoformat()
+    return {"nodes": n, "failed_nodes": n["total"] - n["alive"], **counts, "under_protected_chunks": len(under),
+            "recent_events": events}
+
+
+@app.get("/admin/repairs")
+def admin_repairs(limit: int = Query(50, ge=1, le=1000)):
+    with pool.connection() as conn:
         rows = conn.execute(
-            """SELECT oc.seq, oc.chunk_hash AS hash, c.size, c.refcount,
-                      coalesce(array_agg(n.node_id || '|' || n.address) FILTER (WHERE n.node_id IS NOT NULL), '{}') AS nodes
-               FROM object_chunks oc
-               JOIN chunks c ON c.hash = oc.chunk_hash
-               LEFT JOIN chunk_locations l ON l.hash = c.hash
-               LEFT JOIN nodes n ON n.node_id = l.node_id
-               WHERE oc.object_id = %s GROUP BY oc.seq, oc.chunk_hash, c.size, c.refcount ORDER BY oc.seq""",
-            (obj["id"],),
-        ).fetchall()
-    return obj, rows
-
-
-@app.get("/objects/{name:path}/manifest")
-def manifest(name: str):
-    obj, rows = load_manifest(name)
-    return {
-        "name": obj["name"], "size": obj["size"], "sha256": obj["sha256"], "chunking": obj["chunking"],
-        "chunks": [
-            {"seq": r["seq"], "hash": r["hash"], "size": r["size"], "refcount": r["refcount"],
-             "nodes": [x.split("|")[0] for x in r["nodes"]]}
-            for r in rows
-        ],
-    }
-
-
-def read_object(name: str) -> tuple[dict, bytes]:
-    obj, rows = load_manifest(name)
-    parts = []
+            "SELECT id, at, kind, chunk_hash, detail FROM repair_log ORDER BY id DESC LIMIT %s", (limit,)).fetchall()
     for r in rows:
-        data = None
-        for entry in r["nodes"]:
-            _, addr = entry.split("|", 1)
-            data = node_get(addr, r["hash"])
-            if data is not None and hashlib.sha256(data).hexdigest() == r["hash"]:
-                break
-            data = None
-        if data is None:
-            raise HTTPException(502, f"chunk {r['seq']} ({r['hash'][:12]}) is unavailable")
-        parts.append(data)
-    return obj, b"".join(parts)
-
-
-@app.get("/objects/{name:path}")
-def get_object(name: str):
-    obj, data = read_object(name)
-    return Response(content=data, media_type="application/octet-stream", headers={"X-Object-SHA256": obj["sha256"]})
-
-
-@app.head("/objects/{name:path}")
-def head_object(name: str):
-    with pool.connection() as conn:
-        obj = conn.execute("SELECT size, sha256 FROM objects WHERE name=%s", (name,)).fetchone()
-    if not obj:
-        return Response(status_code=404)
-    return Response(status_code=200, headers={"Content-Length": str(obj["size"]), "X-Object-SHA256": obj["sha256"]})
-
-
-@app.delete("/objects/{name:path}")
-def delete_object(name: str):
-    freed = []
-    with pool.connection() as conn:
-        obj = conn.execute("SELECT id FROM objects WHERE name=%s FOR UPDATE", (name,)).fetchone()
-        if not obj:
-            raise HTTPException(404, "object not found")
-        refs = conn.execute(
-            "SELECT chunk_hash, count(*) AS k FROM object_chunks WHERE object_id=%s GROUP BY chunk_hash ORDER BY chunk_hash",
-            (obj["id"],),
-        ).fetchall()
-        conn.execute("DELETE FROM objects WHERE id=%s", (obj["id"],))
-        for r in refs:
-            h = r["chunk_hash"]
-            lock_hash(conn, h)
-            left = conn.execute(
-                "UPDATE chunks SET refcount = refcount - %s WHERE hash=%s RETURNING refcount", (r["k"], h)
-            ).fetchone()["refcount"]
-            if left > 0:
-                continue  # another object (or another part of this one) still references it
-            # Last reference gone: forget the chunk and queue its copies for removal.
-            conn.execute(
-                "INSERT INTO gc_queue (hash, node_id) SELECT hash, node_id FROM chunk_locations WHERE hash=%s "
-                "ON CONFLICT DO NOTHING", (h,))
-            conn.execute("DELETE FROM chunks WHERE hash=%s", (h,))
-            freed.append(h)
-    run_gc()  # after commit; anything that fails stays queued for the background pass
-    return {"deleted": name, "chunks_freed": len(freed)}
-
-
-@app.get("/objects")
-def list_objects():
-    with pool.connection() as conn:
-        rows = conn.execute(
-            "SELECT name, size, chunking, chunk_count, created_at FROM objects ORDER BY name"
-        ).fetchall()
+        r["at"] = r["at"].isoformat()
     return rows
 
 
-# ------------------------------------------------------------------ chunks, ring, stats
+@app.post("/admin/repair")
+async def admin_repair():
+    return await run_in_threadpool(maintenance.repair_pass)
 
-@app.get("/chunks/{chunk_hash}")
+
+@app.post("/admin/scrub")
+async def admin_scrub():
+    return await run_in_threadpool(maintenance.scrub_pass)
+
+
+@app.post("/admin/rebalance")
+async def admin_rebalance(dry_run: bool = False):
+    return await run_in_threadpool(maintenance.rebalance, not dry_run)
+
+
+@app.post("/admin/gc")
+async def admin_gc():
+    return {"removed": await run_in_threadpool(maintenance.run_gc)}
+
+
+@app.post("/admin/nodes/{node_id}/decommission")
+async def decommission(node_id: str):
+    """Take a node out of the ring and move its data to the nodes that now own it."""
+    with pool.connection() as conn:
+        row = conn.execute("UPDATE nodes SET in_ring=false WHERE node_id=%s RETURNING node_id", (node_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "unknown node")
+    ring.remove_node(node_id)
+    result = await run_in_threadpool(maintenance.rebalance, True)
+    with pool.connection() as conn:
+        left = conn.execute("SELECT count(*) AS n FROM chunk_locations WHERE node_id=%s", (node_id,)).fetchone()["n"]
+    return {"node": node_id, "pieces_left_on_node": left, "safe_to_remove": left == 0, "rebalance": result}
+
+
+@app.delete("/admin/nodes/{node_id}", status_code=204)
+def forget_node(node_id: str):
+    """Remove a decommissioned, empty node from the cluster records."""
+    with pool.connection() as conn:
+        if conn.execute("SELECT 1 FROM chunk_locations WHERE node_id=%s LIMIT 1", (node_id,)).fetchone():
+            raise HTTPException(409, "node still holds data; decommission it first")
+        conn.execute("DELETE FROM gc_queue WHERE node_id=%s", (node_id,))
+        conn.execute("DELETE FROM nodes WHERE node_id=%s", (node_id,))
+    ring.remove_node(node_id)
+    return Response(status_code=204)
+
+
+@app.post("/admin/nodes/{node_id}/join")
+def join(node_id: str):
+    with pool.connection() as conn:
+        row = conn.execute("UPDATE nodes SET in_ring=true WHERE node_id=%s RETURNING node_id", (node_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "unknown node")
+    ring.add_node(node_id)
+    return {"node": node_id, "ring": ring.nodes, "hint": "POST /admin/rebalance to move data onto it"}
+
+
+@app.get("/admin/chunks/{chunk_hash}")
 def chunk_info(chunk_hash: str):
     with pool.connection() as conn:
-        c = conn.execute("SELECT hash, size, refcount FROM chunks WHERE hash=%s", (chunk_hash,)).fetchone()
+        c = conn.execute("SELECT * FROM chunks WHERE hash=%s", (chunk_hash,)).fetchone()
         if not c:
             raise HTTPException(404, "chunk not found")
-        c["nodes"] = [r["node_id"] for r in conn.execute(
-            "SELECT node_id FROM chunk_locations WHERE hash=%s ORDER BY node_id", (chunk_hash,)).fetchall()]
+        c["locations"] = conn.execute(
+            "SELECT shard_idx, shard_hash, node_id, size FROM chunk_locations WHERE chunk_hash=%s "
+            "ORDER BY shard_idx, node_id", (chunk_hash,)).fetchall()
     return c
 
 
-@app.get("/ring")
+@app.get("/admin/ring")
 def ring_info():
-    return {"vnodes_per_node": ring.vnodes, "replication_factor": REPLICATION_FACTOR, "nodes": ring.nodes}
+    return {"vnodes_per_node": ring.vnodes, "nodes": ring.nodes}
 
 
-@app.get("/ring/lookup/{chunk_hash}")
+@app.get("/admin/ring/lookup/{chunk_hash}")
 def ring_lookup(chunk_hash: str, n: int = Query(1, ge=1, le=16)):
-    if len(chunk_hash) < 16:
-        raise HTTPException(400, "need a hex chunk hash")
     try:
         return {"chunk": chunk_hash, "nodes": ring.lookup(chunk_hash, n)}
     except ValueError:
         raise HTTPException(400, "need a hex chunk hash")
 
 
-@app.get("/ring/distribution")
+@app.get("/admin/ring/distribution")
 def ring_distribution(samples: int = Query(100000, ge=100, le=1000000)):
     counts: Counter = Counter()
     rnd = random.Random(1)
@@ -458,14 +236,186 @@ def ring_distribution(samples: int = Query(100000, ge=100, le=1000000)):
     return {n: {"keys": counts[n], "share": round(counts[n] / samples, 4)} for n in ring.nodes}
 
 
-@app.get("/stats")
+@app.get("/admin/stats")
 def stats():
     with pool.connection() as conn:
-        o = conn.execute("SELECT count(*) AS objects, coalesce(sum(size),0) AS logical_bytes, "
-                         "coalesce(sum(chunk_count),0) AS chunk_refs FROM objects").fetchone()
-        c = conn.execute("SELECT count(*) AS unique_chunks, coalesce(sum(size),0) AS unique_bytes FROM chunks").fetchone()
+        o = conn.execute("SELECT count(*) AS objects, coalesce(sum(size),0)::bigint AS logical_bytes, "
+                         "coalesce(sum(chunk_count),0)::bigint AS chunk_references FROM objects").fetchone()
+        c = conn.execute("SELECT count(*) AS unique_chunks, coalesce(sum(size),0)::bigint AS unique_bytes FROM chunks").fetchone()
+        raw = conn.execute("SELECT coalesce(sum(size),0)::bigint AS raw_bytes, count(*) AS stored_pieces FROM chunk_locations").fetchone()
+        by_mode = conn.execute(
+            "SELECT c.mode, count(*) AS chunks, coalesce(sum(c.size),0)::bigint AS unique_bytes, "
+            "coalesce(sum(s.raw),0)::bigint AS raw_bytes FROM chunks c LEFT JOIN "
+            "(SELECT chunk_hash, sum(size) AS raw FROM chunk_locations GROUP BY chunk_hash) s ON s.chunk_hash=c.hash "
+            "GROUP BY c.mode").fetchall()
+    ub = c["unique_bytes"]
     return {
-        **o, **c,
-        "dedup_ratio": round(o["logical_bytes"] / c["unique_bytes"], 3) if c["unique_bytes"] else None,
-        "bytes_saved": int(o["logical_bytes"]) - int(c["unique_bytes"]),
+        **o, **c, **raw,
+        "dedup_ratio": round(o["logical_bytes"] / ub, 3) if ub else None,
+        "bytes_saved_by_dedup": int(o["logical_bytes"]) - int(ub),
+        "redundancy_overhead": round(raw["raw_bytes"] / ub, 3) if ub else None,
+        "by_durability": [{**r, "overhead": round(r["raw_bytes"] / r["unique_bytes"], 3) if r["unique_bytes"] else None}
+                          for r in by_mode],
     }
+
+
+# ------------------------------------------------------------------ search
+
+@app.get("/search")
+def search(request: Request, q: str = "", bucket: str = "", prefix: str = "", min_size: int | None = None,
+           max_size: int | None = None, content_type: str = "", limit: int = Query(100, ge=1, le=10000)):
+    """Find objects by key/metadata text, size range, content type or exact user metadata (meta.<name>=<value>)."""
+    meta = {k[5:].lower(): v for k, v in request.query_params.items() if k.startswith("meta.")}
+    results = store.search_objects(q, bucket, prefix, min_size, max_size, content_type, meta, limit)
+    return {"count": len(results), "results": results}
+
+
+# ------------------------------------------------------------------ S3-like API: buckets
+
+def check_bucket_name(name: str):
+    if name in RESERVED or not BUCKET_RE.match(name):
+        raise HTTPException(400, "InvalidBucketName: use 3-63 chars of a-z, 0-9, '.' or '-'")
+
+
+@app.get("/")
+def list_buckets():
+    with pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT b.name, b.created_at, count(o.id) AS objects, coalesce(sum(o.size),0)::bigint AS bytes "
+            "FROM buckets b LEFT JOIN objects o ON o.bucket = b.name GROUP BY b.name, b.created_at ORDER BY b.name").fetchall()
+    for r in rows:
+        r["created_at"] = r["created_at"].isoformat()
+    return {"buckets": rows}
+
+
+@app.put("/{bucket}", status_code=201)
+def create_bucket(bucket: str):
+    check_bucket_name(bucket)
+    with pool.connection() as conn:
+        row = conn.execute("INSERT INTO buckets (name) VALUES (%s) ON CONFLICT DO NOTHING RETURNING name", (bucket,)).fetchone()
+    if not row:
+        raise HTTPException(409, "BucketAlreadyExists")
+    return {"bucket": bucket}
+
+
+@app.head("/{bucket}")
+def head_bucket(bucket: str):
+    with pool.connection() as conn:
+        ok = conn.execute("SELECT 1 FROM buckets WHERE name=%s", (bucket,)).fetchone()
+    return Response(status_code=200 if ok else 404)
+
+
+@app.delete("/{bucket}", status_code=204)
+def delete_bucket(bucket: str):
+    with pool.connection() as conn:
+        if not conn.execute("SELECT 1 FROM buckets WHERE name=%s", (bucket,)).fetchone():
+            raise HTTPException(404, "NoSuchBucket")
+        if conn.execute("SELECT 1 FROM objects WHERE bucket=%s LIMIT 1", (bucket,)).fetchone():
+            raise HTTPException(409, "BucketNotEmpty")
+        conn.execute("DELETE FROM buckets WHERE name=%s", (bucket,))
+    return Response(status_code=204)
+
+
+@app.get("/{bucket}")
+def list_objects_v2(bucket: str, prefix: str = "", delimiter: str = "",
+                    max_keys: int = Query(1000, alias="max-keys", ge=1, le=1000),
+                    continuation_token: str = Query("", alias="continuation-token"),
+                    start_after: str = Query("", alias="start-after")):
+    return store.list_objects(bucket, prefix, delimiter, max_keys, continuation_token or start_after)
+
+
+# ------------------------------------------------------------------ S3-like API: objects
+
+def user_meta(request: Request) -> dict:
+    return {k[len("x-amz-meta-"):]: v for k, v in request.headers.items() if k.startswith("x-amz-meta-")}
+
+
+def object_headers(obj: dict) -> dict:
+    h = {"ETag": f'"{obj["sha256"]}"', "Accept-Ranges": "bytes", "Last-Modified": format_datetime(obj["created_at"], usegmt=True),
+         "X-DFS-Durability": obj["durability"], "X-DFS-Chunking": obj["chunking"], "X-DFS-Chunks": str(obj["chunk_count"])}
+    h.update({f"x-amz-meta-{k}": str(v) for k, v in obj["meta"].items()})
+    return h
+
+
+@app.put("/{bucket}/{key:path}", status_code=200)
+async def put_object(
+    bucket: str, key: str, request: Request,
+    chunking: str = Query(config.DEFAULT_CHUNKING, pattern="^(fixed|cdc)$"),
+    chunk_size: int = Query(config.CHUNK_SIZE, ge=1024),
+    cdc_min: int = Query(256 * 1024, ge=64), cdc_avg: int = Query(1024 * 1024, ge=256), cdc_max: int = Query(4 * 1024 * 1024, ge=1024),
+    durability: str = Query(config.DEFAULT_DURABILITY, pattern="^(replication|ec)$"),
+    copies: int = Query(config.REPLICATION_FACTOR, ge=1), k: int = Query(config.EC_K, ge=1), m: int = Query(config.EC_M, ge=1),
+):
+    declared = request.headers.get("content-length")
+    if declared and int(declared) > config.MAX_OBJECT_BYTES:
+        raise HTTPException(413, "EntityTooLarge")
+    data = await request.body()
+    if len(data) > config.MAX_OBJECT_BYTES:
+        raise HTTPException(413, "EntityTooLarge")
+    if not data:
+        raise HTTPException(400, "empty objects are not supported")
+    d = store.Durability("rep", copies=copies) if durability == "replication" else store.Durability("ec", k=k, m=m)
+    result = await run_in_threadpool(
+        store.put_object, bucket, key, data, chunking,
+        {"chunk_size": chunk_size, "min_size": cdc_min, "avg_size": cdc_avg, "max_size": cdc_max},
+        d, request.headers.get("content-type", "application/octet-stream"), user_meta(request))
+    return Response(content=json.dumps(result), media_type="application/json",
+                    headers={"ETag": f'"{result["etag"]}"'})
+
+
+def parse_range(header: str, size: int) -> tuple[int, int]:
+    m = re.fullmatch(r"bytes=(\d*)-(\d*)", header.strip())
+    if not m or (not m.group(1) and not m.group(2)):
+        raise HTTPException(416, "InvalidRange")
+    if not m.group(1):  # suffix: last N bytes
+        start, end = max(size - int(m.group(2)), 0), size - 1
+    else:
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else size - 1
+    if start >= size or start > end:
+        raise HTTPException(416, "InvalidRange")
+    return start, min(end, size - 1)
+
+
+@app.get("/admin/manifest/{bucket}/{key:path}")
+def manifest(bucket: str, key: str):
+    obj, rows = store.load_manifest(bucket, key)
+    return {"bucket": bucket, "key": key, "size": obj["size"], "etag": obj["sha256"], "chunking": obj["chunking"],
+            "durability": obj["durability"], "chunks": [
+                {"seq": r["seq"], "hash": r["hash"], "size": r["size"], "refcount": r["refcount"], "mode": r["mode"],
+                 "pieces": [{"idx": l["idx"], "node": l["node"], "alive": l["alive"]} for l in r["locs"]]}
+                for r in rows]}
+
+
+@app.get("/{bucket}/{key:path}")
+def get_object(bucket: str, key: str, request: Request):
+    rng = request.headers.get("range")
+    if rng:
+        with pool.connection() as conn:
+            row = conn.execute("SELECT size FROM objects WHERE bucket=%s AND key=%s", (bucket, key)).fetchone()
+        if not row:
+            raise HTTPException(404, "NoSuchKey")
+        start, end = parse_range(rng, row["size"])
+        obj, data, degraded = store.read_object(bucket, key, start, end)
+        headers = {**object_headers(obj), "Content-Range": f"bytes {start}-{end}/{obj['size']}",
+                   "X-DFS-Degraded-Chunks": str(degraded)}
+        return Response(content=data, status_code=206, media_type=obj["content_type"], headers=headers)
+    obj, data, degraded = store.read_object(bucket, key)
+    return Response(content=data, media_type=obj["content_type"],
+                    headers={**object_headers(obj), "X-DFS-Degraded-Chunks": str(degraded)})
+
+
+@app.head("/{bucket}/{key:path}")
+def head_object(bucket: str, key: str):
+    with pool.connection() as conn:
+        obj = conn.execute("SELECT * FROM objects WHERE bucket=%s AND key=%s", (bucket, key)).fetchone()
+    if not obj:
+        return Response(status_code=404)
+    return Response(status_code=200, media_type=obj["content_type"],
+                    headers={**object_headers(obj), "Content-Length": str(obj["size"])})
+
+
+@app.delete("/{bucket}/{key:path}", status_code=204)
+def delete_object(bucket: str, key: str):
+    store.delete_object(bucket, key)  # S3 returns 204 even when the key does not exist
+    return Response(status_code=204)
