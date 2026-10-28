@@ -1,4 +1,4 @@
-﻿name: dfs-storage
+name: dfs-storage
 
 x-node: &node
   build: {context: ., args: {BASE: "${DFS_BASE:-mirror.gcr.io/library/python:3.12-slim}"}}

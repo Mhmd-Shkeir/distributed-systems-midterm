@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Distributed Object Storage</title>
+<!-- React 18 (UMD build) and Babel, loaded from a CDN: no build step is needed. The page is served by the gateway itself. -->
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" crossorigin></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #f4f6f8; color: #1d2733; }
+  header { background: #1f3a5f; color: #fff; padding: 12px 24px; display: flex; align-items: center; gap: 24px; }
+  header h1 { font-size: 18px; margin: 0; }
+  nav button { background: transparent; color: #cfe0f5; border: 0; padding: 8px 14px; font-size: 14px; cursor: pointer; border-bottom: 3px solid transparent; }
+  nav button.on { color: #fff; border-bottom-color: #5aa9ff; }
+  main { padding: 20px 24px; max-width: 1150px; margin: auto; }
+  section { background: #fff; border-radius: 8px; padding: 16px 18px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #e6eaee; }
+  th { color: #5b6b7b; font-weight: 600; }
+  input, select, button.act { font-size: 13px; padding: 6px 8px; margin: 0 6px 6px 0; border: 1px solid #b9c4d0; border-radius: 4px; }
+  button.act { background: #1f6fd1; color: #fff; border-color: #1f6fd1; cursor: pointer; }
+  button.red { background: #c0392b; border-color: #c0392b; }
+  a { color: #1f6fd1; }
+  .ok { color: #1a7f37; font-weight: 600; } .bad { color: #c0392b; font-weight: 600; }
+  .bar { background: #dce7f5; border-radius: 3px; height: 16px; } .bar div { background: #3b82d6; height: 16px; border-radius: 3px; }
+  .msg { font-size: 13px; color: #5b6b7b; margin: 6px 0; }
+  pre { background: #f1f4f8; padding: 8px; font-size: 12px; overflow: auto; max-height: 220px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+  .card { background: #f1f4f8; border-radius: 6px; padding: 10px; } .card b { display: block; font-size: 20px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+const fmt = (n) => n == null ? "" : n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KiB" : n < 1073741824 ? (n / 1048576).toFixed(1) + " MiB" : (n / 1073741824).toFixed(1) + " GiB";
+const get = async (url) => { const r = await fetch(url); if (!r.ok) throw new Error(url + " -> " + r.status + " " + (await r.text()).slice(0, 150)); return r.json(); };
+
+function Objects() {
+  const [buckets, setBuckets] = useState([]);
+  const [bucket, setBucket] = useState("");
+  const [prefix, setPrefix] = useState("");
+  const [items, setItems] = useState([]);
+  const [msg, setMsg] = useState("");
+  const [detail, setDetail] = useState(null);
+  const [newName, setNewName] = useState("");
+  const [dur, setDur] = useState("replication");
+  const [file, setFile] = useState(null);
+  const [key, setKey] = useState("");
+
+  const loadBuckets = useCallback(async () => {
+    try { const b = (await get("/")).buckets; setBuckets(b); if (!bucket && b.length) setBucket(b[0].name); } catch (e) { setMsg(e.message); }
+  }, [bucket]);
+  const loadObjects = useCallback(async () => {
+    if (!bucket) { setItems([]); return; }
+    try { setItems((await get(`/${bucket}?prefix=${encodeURIComponent(prefix)}&max-keys=200`)).contents); setMsg(""); } catch (e) { setMsg(e.message); }
+  }, [bucket, prefix]);
+  useEffect(() => { loadBuckets(); }, []);
+  useEffect(() => { loadObjects(); }, [bucket, prefix]);
+
+  const createBucket = async () => {
+    const q = dur === "ec" ? "?durability=ec&k=2&m=2" : "";
+    const r = await fetch(`/${newName}${q}`, { method: "PUT" });
+    setMsg(r.ok ? `bucket ${newName} created (${(await r.json()).durability})` : await r.text());
+    setNewName(""); setBucket(newName); loadBuckets();
+  };
+  const upload = async () => {
+    if (!file || !bucket) return;
+    const k = key || file.name; setMsg("uploading " + k + " ...");
+    const r = await fetch(`/${bucket}/${k}`, { method: "PUT", body: file, headers: { "Content-Type": file.type || "application/octet-stream" } });
+    const j = await r.json().catch(() => ({}));
+    setMsg(r.ok ? `uploaded ${k}: ${j.chunks} chunk(s), ${j.new_chunks} new, ${fmt(j.bytes_deduplicated)} deduplicated, ${j.durability}` : "upload failed: " + JSON.stringify(j));
+    setFile(null); setKey(""); loadObjects(); loadBuckets();
+  };
+  const del = async (k) => { await fetch(`/${bucket}/${k}`, { method: "DELETE" }); setDetail(null); loadObjects(); };
+  const show = async (k) => {
+    try { setDetail({ key: k, ...(await get(`/admin/manifest/${bucket}/${k}`)) }); } catch (e) { setMsg(e.message); }
+  };
+
+  return (<div>
+    <section><h2>Buckets</h2>
+      <select value={bucket} onChange={(e) => setBucket(e.target.value)}>
+        {buckets.map((b) => <option key={b.name} value={b.name}>{b.name} ({b.objects} objects, {b.durability === "ec" ? `EC ${b.k}+${b.m}` : `N=${b.copies} W=${b.write_q} R=${b.read_q}`})</option>)}
+      </select>
+      <input placeholder="new bucket name" value={newName} onChange={(e) => setNewName(e.target.value)} />
+      <select value={dur} onChange={(e) => setDur(e.target.value)}><option value="replication">replication</option><option value="ec">erasure coding 2+2</option></select>
+      <button className="act" onClick={createBucket} disabled={!newName}>Create bucket</button>
+    </section>
+    <section><h2>Upload</h2>
+      <input type="file" onChange={(e) => { setFile(e.target.files[0]); setKey(e.target.files[0] ? e.target.files[0].name : ""); }} />
+      <input placeholder="object key" value={key} onChange={(e) => setKey(e.target.value)} />
+      <button className="act" onClick={upload} disabled={!file || !bucket}>Upload to {bucket || "..."}</button>
+    </section>
+    <section><h2>Objects in {bucket}</h2>
+      <input placeholder="key prefix" value={prefix} onChange={(e) => setPrefix(e.target.value)} />
+      <button className="act" onClick={loadObjects}>Refresh</button>
+      <div className="msg">{msg}</div>
+      <table><thead><tr><th>Key</th><th>Size</th><th>Type</th><th>Modified</th><th></th></tr></thead><tbody>
+        {items.map((o) => <tr key={o.key}><td>{o.key}</td><td>{fmt(o.size)}</td><td>{o.content_type}</td><td>{o.last_modified.slice(0, 19).replace("T", " ")}</td>
+          <td><a href={`/${bucket}/${o.key}`} download={o.key.split("/").pop()}>download</a> · <a href="#" onClick={(e) => { e.preventDefault(); show(o.key); }}>info</a> · <a href="#" onClick={(e) => { e.preventDefault(); del(o.key); }}>delete</a></td></tr>)}
+        {!items.length && <tr><td colSpan="5">no objects</td></tr>}
+      </tbody></table>
+    </section>
+    {detail && <section><h2>Metadata of {detail.key}</h2>
+      <div className="msg">{fmt(detail.size)} · {detail.durability} · {detail.chunking} chunking · {detail.chunks.length} chunk(s) · ETag {detail.etag.slice(0, 16)}…</div>
+      <table><thead><tr><th>#</th><th>Chunk (SHA-256)</th><th>Size</th><th>Refs</th><th>Stored on</th></tr></thead><tbody>
+        {detail.chunks.map((c) => <tr key={c.seq}><td>{c.seq}</td><td>{c.hash.slice(0, 16)}…</td><td>{fmt(c.size)}</td><td>{c.refcount}</td>
+          <td>{c.pieces.map((p) => <span key={p.idx + p.node} className={p.alive ? "ok" : "bad"}>{p.node}{c.mode === "ec" ? `#${p.idx}` : ""} </span>)}</td></tr>)}
+      </tbody></table></section>}
+  </div>);
+}
+
+function Cluster() {
+  const [c, setC] = useState(null);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    const load = () => get("/cluster/status").then((j) => { setC(j); setErr(""); }).catch((e) => setErr(e.message));
+    load(); const t = setInterval(load, 4000); return () => clearInterval(t);
+  }, []);
+  if (err) return <section className="bad">{err}</section>;
+  if (!c) return <section>loading…</section>;
+  const max = Math.max(1, ...c.nodes.map((n) => n.pieces));
+  const s = c.storage;
+  return (<div>
+    <section><h2>Cluster</h2><div className="grid">
+      <div className="card">Nodes alive<b>{c.nodes.filter((n) => n.alive).length} / {c.nodes.length}</b></div>
+      <div className="card">Under-protected chunks<b className={c.under_protected_chunks ? "bad" : "ok"}>{c.under_protected_chunks}</b></div>
+      <div className="card">Objects<b>{s.objects}</b></div>
+      <div className="card">Logical data<b>{fmt(s.logical_bytes)}</b></div>
+      <div className="card">Stored on nodes<b>{fmt(s.raw_bytes)}</b></div>
+      <div className="card">Dedup ratio<b>{s.dedup_ratio ?? "-"}</b></div>
+      <div className="card">Redundancy overhead<b>{s.redundancy_overhead ?? "-"}x</b></div>
+      <div className="card">Policy<b style={{ fontSize: 14 }}>N={c.config.replication_factor} W={c.config.write_quorum} R={c.config.read_quorum} · EC {c.config.ec.k}+{c.config.ec.m}</b></div>
+    </div></section>
+    <section><h2>Node health and chunk distribution</h2>
+      <table><thead><tr><th>Node</th><th>Status</th><th>Heartbeat</th><th>Free space</th><th>Pieces stored</th><th style={{ width: "30%" }}>Distribution</th><th>Data</th></tr></thead><tbody>
+        {c.nodes.map((n) => <tr key={n.node_id}><td>{n.node_id}</td><td className={n.alive ? "ok" : "bad"}>{n.alive ? "alive" : "FAILED"}</td>
+          <td>{n.age_seconds}s ago</td><td>{fmt(n.free_bytes)}</td><td>{n.pieces}</td>
+          <td><div className="bar"><div style={{ width: (100 * n.pieces / max) + "%" }} /></div></td><td>{fmt(n.stored_bytes)}</td></tr>)}
+      </tbody></table></section>
+    <section><h2>Recent repairs and scrubbing</h2>
+      <table><thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead><tbody>
+        {c.recent_repairs.map((r) => <tr key={r.id}><td>{r.at.slice(11, 19)}</td><td>{r.kind}</td><td>{r.detail}</td></tr>)}
+        {!c.recent_repairs.length && <tr><td colSpan="3">no repairs yet</td></tr>}
+      </tbody></table></section>
+  </div>);
+}
+
+function Search() {
+  const [f, setF] = useState({ q: "", prefix: "", min_size: "", max_size: "", created_after: "", created_before: "", tagk: "", tagv: "" });
+  const [res, setRes] = useState(null);
+  const [err, setErr] = useState("");
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const run = async () => {
+    const p = new URLSearchParams();
+    ["q", "prefix", "min_size", "max_size", "created_after", "created_before"].forEach((k) => f[k] && p.set(k, f[k]));
+    if (f.tagk && f.tagv) p.set("tag." + f.tagk, f.tagv);
+    try { setRes((await get("/search?" + p)).results); setErr(""); } catch (e) { setErr(e.message); }
+  };
+  return (<section><h2>Search objects (metadata)</h2>
+    <input placeholder="text in key / tags" value={f.q} onChange={set("q")} />
+    <input placeholder="key prefix" value={f.prefix} onChange={set("prefix")} />
+    <input placeholder="min size (bytes)" value={f.min_size} onChange={set("min_size")} />
+    <input placeholder="max size (bytes)" value={f.max_size} onChange={set("max_size")} /><br />
+    created after <input type="date" value={f.created_after} onChange={set("created_after")} />
+    before <input type="date" value={f.created_before} onChange={set("created_before")} />
+    tag <input placeholder="name" value={f.tagk} onChange={set("tagk")} style={{ width: 90 }} /> = <input placeholder="value" value={f.tagv} onChange={set("tagv")} style={{ width: 110 }} />
+    <button className="act" onClick={run}>Search</button>
+    {err && <div className="bad">{err}</div>}
+    {res && <table><thead><tr><th>Bucket</th><th>Key</th><th>Size</th><th>Type</th><th>Tags</th><th>Created</th></tr></thead><tbody>
+      {res.map((o) => <tr key={o.bucket + o.key}><td>{o.bucket}</td><td><a href={`/${o.bucket}/${o.key}`}>{o.key}</a></td><td>{fmt(o.size)}</td><td>{o.content_type}</td>
+        <td>{Object.entries(o.meta).map(([k, v]) => k + "=" + v).join(", ")}</td><td>{o.created_at.slice(0, 19).replace("T", " ")}</td></tr>)}
+      {!res.length && <tr><td colSpan="6">no matches</td></tr>}</tbody></table>}
+  </section>);
+}
+
+function App() {
+  const [tab, setTab] = useState("objects");
+  return (<div>
+    <header><h1>Distributed Object Storage</h1>
+      <nav>{[["objects", "Objects"], ["cluster", "Cluster"], ["search", "Search"]].map(([k, l]) => <button key={k} className={tab === k ? "on" : ""} onClick={() => setTab(k)}>{l}</button>)}</nav></header>
+    <main>{tab === "objects" ? <Objects /> : tab === "cluster" ? <Cluster /> : <Search />}</main>
+  </div>);
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
