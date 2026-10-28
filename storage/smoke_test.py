@@ -20,6 +20,13 @@ def check(name, cond, detail=""):
 data = b"hello distributed systems " * 1000
 h = hashlib.sha256(data).hexdigest()
 
+def cleanup():
+    for url in NODES.values():
+        requests.delete(f"{url}/chunks/{h}")
+
+
+cleanup()  # make the test re-runnable: start from a known-empty state
+
 for node, url in NODES.items():
     c = f"{url}/chunks/{h}"
     check(f"{node} HEAD missing -> 404", requests.head(c).status_code == 404)
@@ -59,5 +66,6 @@ check("heartbeat chunk counts correct (node1=0,node2=0,node3=1,node4=1)",
       [nodes[f"node{i}"]["chunk_count"] for i in range(1, 5)] == [0, 0, 1, 1],
       str({k: v["chunk_count"] for k, v in nodes.items()}))
 
+cleanup()
 print(f"\n{len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
