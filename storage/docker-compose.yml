@@ -9,11 +9,31 @@ x-node: &node
     HEARTBEAT_INTERVAL: "5"
 
 services:
+  postgres:
+    image: mirror.gcr.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: dfs
+      POSTGRES_PASSWORD: dfs
+      POSTGRES_DB: dfs
+    ports: ["5433:5432"]   # host port 5433 so it does not clash with a local Postgres
+    volumes: ["pg-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dfs -d dfs"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
   metadata:
     build: .
     image: dfs-storage-node:latest
-    command: ["uvicorn", "metadata_stub.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "metadata.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql://dfs:dfs@postgres:5432/dfs
+      REPLICATION_FACTOR: "1"
+      VNODES: "128"
     ports: ["8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
 
   node1:
     <<: *node
@@ -41,6 +61,7 @@ services:
 
 # One named volume per node = each node has its own separate local disk.
 volumes:
+  pg-data:
   node1-data:
   node2-data:
   node3-data:
