@@ -1,0 +1,47 @@
+name: dfs-storage
+
+x-node: &node
+  build: .
+  image: dfs-storage-node:latest
+  depends_on: [metadata]
+  environment: &node-env
+    METADATA_URL: http://metadata:8000
+    HEARTBEAT_INTERVAL: "5"
+
+services:
+  metadata:
+    build: .
+    image: dfs-storage-node:latest
+    command: ["uvicorn", "metadata_stub.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["8000:8000"]
+
+  node1:
+    <<: *node
+    environment: {<<: *node-env, NODE_ID: node1, PUBLIC_ADDR: "http://node1:8080"}
+    ports: ["8101:8080"]
+    volumes: ["node1-data:/data"]
+
+  node2:
+    <<: *node
+    environment: {<<: *node-env, NODE_ID: node2, PUBLIC_ADDR: "http://node2:8080"}
+    ports: ["8102:8080"]
+    volumes: ["node2-data:/data"]
+
+  node3:
+    <<: *node
+    environment: {<<: *node-env, NODE_ID: node3, PUBLIC_ADDR: "http://node3:8080"}
+    ports: ["8103:8080"]
+    volumes: ["node3-data:/data"]
+
+  node4:
+    <<: *node
+    environment: {<<: *node-env, NODE_ID: node4, PUBLIC_ADDR: "http://node4:8080"}
+    ports: ["8104:8080"]
+    volumes: ["node4-data:/data"]
+
+# One named volume per node = each node has its own separate local disk.
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
