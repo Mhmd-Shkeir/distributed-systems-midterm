@@ -41,6 +41,8 @@ async def periodic(fn, interval: float, name: str):
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if config.WRITE_QUORUM + config.READ_QUORUM <= config.REPLICATION_FACTOR:
+        raise RuntimeError(f"invalid quorums: W + R must be > N ({config.WRITE_QUORUM} + {config.READ_QUORUM} <= {config.REPLICATION_FACTOR})")
     pool.open()
     for _attempt in range(30):
         try:
@@ -112,7 +114,8 @@ def list_nodes():
 
 @app.get("/admin/config")
 def admin_config():
-    return {"replication_factor": config.REPLICATION_FACTOR, "ec": {"k": config.EC_K, "m": config.EC_M},
+    return {"replication_factor": config.REPLICATION_FACTOR, "write_quorum": config.WRITE_QUORUM,
+            "read_quorum": config.READ_QUORUM, "ec": {"k": config.EC_K, "m": config.EC_M},
             "default_durability": config.DEFAULT_DURABILITY, "default_chunking": config.DEFAULT_CHUNKING,
             "chunk_size": config.CHUNK_SIZE, "vnodes_per_node": config.VNODES, "dead_after_seconds": config.DEAD_AFTER,
             "repair_interval": config.REPAIR_INTERVAL, "scrub_interval": config.SCRUB_INTERVAL,
@@ -164,6 +167,26 @@ async def admin_rebalance(dry_run: bool = False):
 @app.post("/admin/gc")
 async def admin_gc():
     return {"removed": await run_in_threadpool(maintenance.run_gc)}
+
+
+@app.get("/admin/nodes/{node_id}/usage")
+def node_usage(node_id: str):
+    """How many pieces (copies or shards) and bytes the metadata says a node holds."""
+    with pool.connection() as conn:
+        r = conn.execute("SELECT count(*) AS pieces, coalesce(sum(size),0)::bigint AS bytes "
+                         "FROM chunk_locations WHERE node_id=%s", (node_id,)).fetchone()
+    return {"node_id": node_id, **r}
+
+
+@app.get("/admin/traffic")
+def admin_traffic():
+    """Bytes moved between the gateway and the storage nodes, by purpose (client, repair, rebalance, scrub, gc)."""
+    return nodes.traffic()
+
+
+@app.post("/admin/traffic/reset")
+def admin_traffic_reset():
+    return nodes.traffic(reset=True)
 
 
 @app.post("/admin/nodes/{node_id}/decommission")
@@ -281,21 +304,41 @@ def check_bucket_name(name: str):
 def list_buckets():
     with pool.connection() as conn:
         rows = conn.execute(
-            "SELECT b.name, b.created_at, count(o.id) AS objects, coalesce(sum(o.size),0)::bigint AS bytes "
-            "FROM buckets b LEFT JOIN objects o ON o.bucket = b.name GROUP BY b.name, b.created_at ORDER BY b.name").fetchall()
+            "SELECT b.name, b.created_at, b.durability, b.copies, b.write_q, b.read_q, b.k, b.m, count(o.id) AS objects, coalesce(sum(o.size),0)::bigint AS bytes "
+            "FROM buckets b LEFT JOIN objects o ON o.bucket = b.name GROUP BY b.name, b.created_at, b.durability, b.copies, b.write_q, b.read_q, b.k, b.m ORDER BY b.name").fetchall()
     for r in rows:
         r["created_at"] = r["created_at"].isoformat()
     return {"buckets": rows}
 
 
 @app.put("/{bucket}", status_code=201)
-def create_bucket(bucket: str):
+def create_bucket(
+    bucket: str,
+    durability: str = Query(config.DEFAULT_DURABILITY, pattern="^(replication|ec)$"),
+    copies: int | None = Query(None, ge=1, description="N: copies per chunk (default from config)"),
+    write_quorum: int | None = Query(None, ge=1, description="W"),
+    read_quorum: int | None = Query(None, ge=1, description="R"),
+    k: int | None = Query(None, ge=1), m: int | None = Query(None, ge=1),
+):
+    """Create a bucket. Its durability policy (N-way replication with quorums, or erasure coding k+m) applies to every
+    object written to it unless a request overrides it."""
     check_bucket_name(bucket)
+    if durability == "replication":
+        n = copies or config.REPLICATION_FACTOR
+        same = n == config.REPLICATION_FACTOR
+        d = store.Durability("rep", copies=n, w=write_quorum or (config.WRITE_QUORUM if same else 0),
+                             r=read_quorum or (config.READ_QUORUM if same else 0))
+    else:
+        d = store.Durability("ec", k=k or config.EC_K, m=m or config.EC_M)
+    store.validate_durability(d)
     with pool.connection() as conn:
-        row = conn.execute("INSERT INTO buckets (name) VALUES (%s) ON CONFLICT DO NOTHING RETURNING name", (bucket,)).fetchone()
+        row = conn.execute(
+            "INSERT INTO buckets (name, durability, copies, write_q, read_q, k, m) VALUES (%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT DO NOTHING RETURNING name",
+            (bucket, "ec" if d.kind == "ec" else "replication", d.copies, d.w, d.r, d.k, d.m)).fetchone()
     if not row:
         raise HTTPException(409, "BucketAlreadyExists")
-    return {"bucket": bucket}
+    return {"bucket": bucket, "durability": d.label()}
 
 
 @app.head("/{bucket}")
@@ -343,8 +386,9 @@ async def put_object(
     chunking: str = Query(config.DEFAULT_CHUNKING, pattern="^(fixed|cdc)$"),
     chunk_size: int = Query(config.CHUNK_SIZE, ge=1024),
     cdc_min: int = Query(256 * 1024, ge=64), cdc_avg: int = Query(1024 * 1024, ge=256), cdc_max: int = Query(4 * 1024 * 1024, ge=1024),
-    durability: str = Query(config.DEFAULT_DURABILITY, pattern="^(replication|ec)$"),
-    copies: int = Query(config.REPLICATION_FACTOR, ge=1), k: int = Query(config.EC_K, ge=1), m: int = Query(config.EC_M, ge=1),
+    durability: str | None = Query(None, pattern="^(replication|ec)$"),
+    copies: int | None = Query(None, ge=1), write_quorum: int | None = Query(None, ge=1),
+    read_quorum: int | None = Query(None, ge=1), k: int | None = Query(None, ge=1), m: int | None = Query(None, ge=1),
 ):
     declared = request.headers.get("content-length")
     if declared and int(declared) > config.MAX_OBJECT_BYTES:
@@ -354,7 +398,8 @@ async def put_object(
         raise HTTPException(413, "EntityTooLarge")
     if not data:
         raise HTTPException(400, "empty objects are not supported")
-    d = store.Durability("rep", copies=copies) if durability == "replication" else store.Durability("ec", k=k, m=m)
+    d = await run_in_threadpool(store.resolve_durability, bucket, durability=durability, copies=copies,
+                                write_quorum=write_quorum, read_quorum=read_quorum, k=k, m=m)
     result = await run_in_threadpool(
         store.put_object, bucket, key, data, chunking,
         {"chunk_size": chunk_size, "min_size": cdc_min, "avg_size": cdc_avg, "max_size": cdc_max},
@@ -387,8 +432,16 @@ def manifest(bucket: str, key: str):
                 for r in rows]}
 
 
+def read_consistency(request: Request) -> str:
+    c = (request.headers.get("x-dfs-consistency") or request.query_params.get("consistency") or "quorum").lower()
+    if c not in ("quorum", "any"):
+        raise HTTPException(400, "consistency must be 'quorum' or 'any'")
+    return c
+
+
 @app.get("/{bucket}/{key:path}")
 def get_object(bucket: str, key: str, request: Request):
+    consistency = read_consistency(request)
     rng = request.headers.get("range")
     if rng:
         with pool.connection() as conn:
@@ -396,11 +449,11 @@ def get_object(bucket: str, key: str, request: Request):
         if not row:
             raise HTTPException(404, "NoSuchKey")
         start, end = parse_range(rng, row["size"])
-        obj, data, degraded = store.read_object(bucket, key, start, end)
+        obj, data, degraded = store.read_object(bucket, key, start, end, consistency)
         headers = {**object_headers(obj), "Content-Range": f"bytes {start}-{end}/{obj['size']}",
                    "X-DFS-Degraded-Chunks": str(degraded)}
         return Response(content=data, status_code=206, media_type=obj["content_type"], headers=headers)
-    obj, data, degraded = store.read_object(bucket, key)
+    obj, data, degraded = store.read_object(bucket, key, consistency=consistency)
     return Response(content=data, media_type=obj["content_type"],
                     headers={**object_headers(obj), "X-DFS-Degraded-Chunks": str(degraded)})
 

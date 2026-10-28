@@ -29,7 +29,9 @@ services:
     command: ["uvicorn", "metadata.app:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       DATABASE_URL: postgresql://dfs:dfs@postgres:5432/dfs
-      REPLICATION_FACTOR: "3"      # default durability: 3 full copies
+      REPLICATION_FACTOR: "3"      # N: 3 full copies per chunk
+      WRITE_QUORUM: "2"            # W: a write is acknowledged once 2 copies are stored
+      READ_QUORUM: "2"             # R: a read needs 2 replicas to confirm (W + R > N)
       EC_K: "2"                    # erasure coding option: 2 data + 2 parity shards
       EC_M: "2"
       VNODES: "128"

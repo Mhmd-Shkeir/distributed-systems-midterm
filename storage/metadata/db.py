@@ -7,7 +7,7 @@ from psycopg_pool import ConnectionPool
 from .config import DATABASE_URL
 
 log = logging.getLogger("metadata.db")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=24, open=False, kwargs={"row_factory": dict_row})
 
@@ -23,9 +23,16 @@ CREATE TABLE nodes (
     last_seen   timestamptz NOT NULL DEFAULT now(),
     in_ring     boolean NOT NULL DEFAULT true
 );
+-- Each bucket carries its durability policy: N-way replication with quorums (W, R), or erasure coding k+m.
 CREATE TABLE buckets (
     name       text PRIMARY KEY,
-    created_at timestamptz NOT NULL DEFAULT now()
+    created_at timestamptz NOT NULL DEFAULT now(),
+    durability text NOT NULL DEFAULT 'replication',
+    copies     integer NOT NULL DEFAULT 3,
+    write_q    integer NOT NULL DEFAULT 2,
+    read_q     integer NOT NULL DEFAULT 2,
+    k          integer NOT NULL DEFAULT 0,
+    m          integer NOT NULL DEFAULT 0
 );
 CREATE TABLE objects (
     id           bigserial PRIMARY KEY,
@@ -51,7 +58,9 @@ CREATE TABLE chunks (
     mode     text NOT NULL,
     copies   integer NOT NULL DEFAULT 1,
     k        integer NOT NULL DEFAULT 0,
-    m        integer NOT NULL DEFAULT 0
+    m        integer NOT NULL DEFAULT 0,
+    write_q  integer NOT NULL DEFAULT 1,
+    read_q   integer NOT NULL DEFAULT 1
 );
 -- Where the bytes live. For replication shard_idx is 0 and shard_hash = chunk hash;
 -- for erasure coding there is one row per shard.

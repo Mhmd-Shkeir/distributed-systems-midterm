@@ -7,7 +7,7 @@ from collections import Counter
 from fastapi import HTTPException
 
 from . import chunking, ec, nodes
-from .config import DEAD_AFTER
+from .config import DEAD_AFTER, EC_K, EC_M, REPLICATION_FACTOR
 from .db import lock_keys, pool
 from .maintenance import queue_gc, release_chunk, run_gc
 from .nodes import ring
@@ -18,8 +18,11 @@ log = logging.getLogger("metadata.store")
 class Durability:
     """How a chunk is protected: full copies ('rep') or Reed-Solomon shards ('ec')."""
 
-    def __init__(self, kind: str, copies: int = 0, k: int = 0, m: int = 0):
+    def __init__(self, kind: str, copies: int = 0, k: int = 0, m: int = 0, w: int = 0, r: int = 0):
         self.kind, self.copies, self.k, self.m = kind, copies, k, m
+        # N copies, W = write quorum, R = read quorum (W + R > N guarantees a read overlaps the last write)
+        self.w = w or (copies // 2 + 1)
+        self.r = r or (copies - self.w + 1)
 
     @property
     def width(self) -> int:  # nodes needed per chunk
@@ -27,20 +30,55 @@ class Durability:
 
     @property
     def write_quorum(self) -> int:  # copies/shards that must be stored before the write is acknowledged
-        return self.copies // 2 + 1 if self.kind == "rep" else min(self.k + 1, self.k + self.m)
+        return self.w if self.kind == "rep" else min(self.k + 1, self.k + self.m)
+
+    @property
+    def read_quorum(self) -> int:  # replicas that must confirm a chunk before it is served (EC always needs k shards)
+        return self.r if self.kind == "rep" else self.k
 
     def label(self) -> str:
-        return f"replication x{self.copies}" if self.kind == "rep" else f"erasure coding {self.k}+{self.m}"
+        if self.kind == "rep":
+            return f"replication N={self.copies} (W={self.w},R={self.r})"
+        return f"erasure coding {self.k}+{self.m}"
 
 
 def validate_durability(d: Durability):
     members = len(ring.nodes)
     if d.kind == "rep":
         if not 1 <= d.copies <= max(members, 1):
-            raise HTTPException(400, f"copies must be between 1 and the number of ring nodes ({members})")
+            raise HTTPException(400, f"copies (N) must be between 1 and the number of ring nodes ({members})")
+        if not (1 <= d.w <= d.copies and 1 <= d.r <= d.copies):
+            raise HTTPException(400, f"write quorum W={d.w} and read quorum R={d.r} must be between 1 and N={d.copies}")
+        if d.w + d.r <= d.copies:
+            raise HTTPException(400, f"quorums must overlap: W + R > N (got {d.w} + {d.r} <= {d.copies})")
     else:
         if d.k < 1 or d.m < 1 or d.k + d.m > members:
             raise HTTPException(400, f"erasure coding k+m must be <= the number of ring nodes ({members}), with k,m >= 1")
+
+
+def bucket_policy(conn, bucket: str) -> Durability:
+    row = conn.execute("SELECT durability, copies, write_q, read_q, k, m FROM buckets WHERE name=%s", (bucket,)).fetchone()
+    if not row:
+        raise HTTPException(404, f"NoSuchBucket: {bucket}")
+    if row["durability"] == "ec":
+        return Durability("ec", k=row["k"], m=row["m"])
+    return Durability("rep", copies=row["copies"], w=row["write_q"], r=row["read_q"])
+
+
+def resolve_durability(bucket: str, **ov) -> Durability:
+    """The bucket's durability policy, unless the request overrides it (durability, copies, write_quorum, read_quorum, k, m)."""
+    with pool.connection() as conn:
+        base = bucket_policy(conn, bucket)
+    kind = ov.get("durability") or ("ec" if base.kind == "ec" else "replication")
+    if kind == "replication":
+        if base.kind == "rep" and not any(ov.get(x) for x in ("copies", "write_quorum", "read_quorum")):
+            return base
+        copies = ov.get("copies") or (base.copies if base.kind == "rep" else REPLICATION_FACTOR)
+        return Durability("rep", copies=copies, w=ov.get("write_quorum") or 0, r=ov.get("read_quorum") or 0)
+    if base.kind == "ec" and not (ov.get("k") or ov.get("m")):
+        return base
+    return Durability("ec", k=ov.get("k") or (base.k if base.kind == "ec" else EC_K),
+                      m=ov.get("m") or (base.m if base.kind == "ec" else EC_M))
 
 
 def _prepare(h: str, piece: bytes, d: Durability) -> list[tuple[int, str, bytes]]:
@@ -123,18 +161,19 @@ def put_object(bucket: str, key: str, data: bytes, strategy: str, cparams: dict,
             new_chunks = bytes_new = raw_written = 0
             for h in sorted(counts):
                 row = conn.execute(
-                    """INSERT INTO chunks (hash, size, refcount, mode, copies, k, m) VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    """INSERT INTO chunks (hash, size, refcount, mode, copies, k, m, write_q, read_q)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        ON CONFLICT (hash) DO UPDATE SET refcount = chunks.refcount + EXCLUDED.refcount
                        RETURNING (xmax = 0) AS inserted""",
-                    (h, len(by_hash[h]), counts[h], d.kind, d.copies, d.k, d.m)).fetchone()
+                    (h, len(by_hash[h]), counts[h], d.kind, d.copies, d.k, d.m, d.write_quorum, d.read_quorum)).fetchone()
                 if not row["inserted"]:
                     continue  # deduplicated: identical chunk already stored, only the reference count grew
                 parts = prepared.get(h) or _prepare(h, by_hash[h], d)
                 lock_keys(conn, [p[1] for p in parts])
                 ok = _place(conn, h, parts, d, alive, placed)
                 if ok < d.write_quorum or ok == 0:
-                    raise HTTPException(503, f"could only store {ok} of {d.width} pieces of a chunk "
-                                             f"(need {d.write_quorum}); too many nodes are down")
+                    raise HTTPException(503, f"write quorum not met: stored {ok} of {d.width} pieces of a chunk "
+                                             f"(W={d.write_quorum}); too many nodes are down")
                 new_chunks += 1
                 bytes_new += len(by_hash[h])
                 raw_written += sum(len(p[2]) for p in parts[:ok]) if d.kind == "ec" else len(by_hash[h]) * ok
@@ -174,31 +213,51 @@ def load_manifest(bucket: str, key: str):
         if not obj:
             raise HTTPException(404, "NoSuchKey")
         rows = conn.execute(
-            """SELECT oc.seq, c.hash, c.size, c.refcount, c.mode, c.k, c.m, c.copies,
+            """SELECT oc.seq, c.hash, c.size, c.refcount, c.mode, c.k, c.m, c.copies, c.read_q,
                       coalesce(json_agg(json_build_object('idx', l.shard_idx, 'hash', l.shard_hash, 'node', l.node_id,
                                'addr', n.address, 'alive', n.last_seen > now() - make_interval(secs => %s)))
                                FILTER (WHERE l.node_id IS NOT NULL), '[]') AS locs
                FROM object_chunks oc JOIN chunks c ON c.hash = oc.chunk_hash
                LEFT JOIN chunk_locations l ON l.chunk_hash = c.hash
                LEFT JOIN nodes n ON n.node_id = l.node_id
-               WHERE oc.object_id = %s GROUP BY oc.seq, c.hash, c.size, c.refcount, c.mode, c.k, c.m, c.copies
+               WHERE oc.object_id = %s GROUP BY oc.seq, c.hash, c.size, c.refcount, c.mode, c.k, c.m, c.copies, c.read_q
                ORDER BY oc.seq""",
             (DEAD_AFTER, obj["id"])).fetchall()
     return obj, rows
 
 
-def read_chunk(row) -> tuple[bytes, bool]:
-    """Return (chunk bytes, degraded). Tries healthy nodes first; erasure-coded chunks decode when needed."""
+def read_chunk(row, consistency: str = "quorum") -> tuple[bytes, bool]:
+    """Return (chunk bytes, degraded). Tries healthy nodes first; erasure-coded chunks decode when needed.
+
+    Replicated chunks use a read quorum: the data is fetched (and hash-verified) from one replica and
+    R-1 further replicas must confirm they hold it, so with W + R > N a read always reaches at least one
+    replica that took part in the last write. consistency='any' skips the quorum and serves from any
+    single healthy replica (a degraded read when fewer than R replicas are reachable).
+    """
     h = row["hash"]
     locs = sorted(row["locs"], key=lambda l: (not l["alive"], l["idx"]))
     if row["mode"] == "rep":
-        degraded = False
+        degraded, source, data = False, None, None
         for l in locs:
             data = nodes.get(l["addr"], h) if l["alive"] else None
             if data is not None:
-                return data, degraded
+                source = l
+                break
             degraded = True
-        raise HTTPException(502, f"all copies of chunk {h[:12]} are unavailable")
+        if data is None:
+            raise HTTPException(502, f"all copies of chunk {h[:12]} are unavailable")
+        need = min(row["read_q"], row["copies"])
+        if consistency == "quorum" and need > 1:
+            confirmed = 1
+            for l in locs:
+                if confirmed >= need:
+                    break
+                if l is not source and l["alive"] and nodes.head(l["addr"], h):
+                    confirmed += 1
+            if confirmed < need:
+                raise HTTPException(503, f"read quorum not met for chunk {h[:12]}: {confirmed} of R={need} replicas "
+                                         f"reachable (retry with X-DFS-Consistency: any for a single-replica read)")
+        return data, degraded
     k, m = row["k"], row["m"]
     got: dict[int, bytes] = {}
     for l in locs:  # data shards first (idx order) so a healthy read needs no decoding
@@ -217,7 +276,7 @@ def read_chunk(row) -> tuple[bytes, bool]:
     return data, degraded
 
 
-def read_object(bucket: str, key: str, start: int = 0, end: int | None = None):
+def read_object(bucket: str, key: str, start: int = 0, end: int | None = None, consistency: str = "quorum"):
     """Return (object row, bytes[start:end+1], number of chunks read in degraded mode)."""
     obj, rows = load_manifest(bucket, key)
     last = obj["size"] - 1 if end is None else min(end, obj["size"] - 1)
@@ -227,7 +286,7 @@ def read_object(bucket: str, key: str, start: int = 0, end: int | None = None):
         pos += r["size"]
         if c_end < start or c_start > last:
             continue
-        data, deg = read_chunk(r)
+        data, deg = read_chunk(r, consistency)
         degraded += deg
         out.append(data[max(start - c_start, 0): last - c_start + 1])
     return obj, b"".join(out), degraded

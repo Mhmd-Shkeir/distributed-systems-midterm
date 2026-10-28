@@ -15,8 +15,10 @@ says they should be, and fix the difference using only healthy sources.
 import hashlib
 import logging
 import threading
+import time
 
 from . import ec, nodes
+from .config import DEAD_AFTER
 from .db import lock_keys, log_event, pool
 from .nodes import ring
 
@@ -49,6 +51,11 @@ def release_chunk(conn, h: str, count: int) -> bool:
 
 
 def run_gc(limit: int = 500) -> int:
+    with nodes.purpose("gc"):
+        return _run_gc(limit)
+
+
+def _run_gc(limit: int) -> int:
     """Delete node copies that no location row references any more."""
     with pool.connection() as conn:
         todo = conn.execute("SELECT hash, node_id FROM gc_queue LIMIT %s", (limit,)).fetchall()
@@ -257,10 +264,20 @@ def under_protected(limit: int = 1000) -> list[str]:
 
 
 def repair_pass(limit: int = 500) -> dict:
-    """Find chunks with fewer healthy copies/shards than required and rebuild them."""
+    with nodes.purpose("repair"):
+        return _repair_pass(limit)
+
+
+def _repair_pass(limit: int) -> dict:
+    """Find chunks with fewer healthy copies/shards than required and rebuild them (a repair job)."""
     if not _busy.acquire(blocking=False):
         return {"skipped": "another maintenance pass is running"}
     try:
+        started = time.time()
+        before = nodes.traffic().get("repair", {})
+        with pool.connection() as conn:
+            failed = [r["node_id"] for r in conn.execute(
+                "SELECT node_id FROM nodes WHERE last_seen <= now() - make_interval(secs => %s)", (DEAD_AFTER,)).fetchall()]
         todo = under_protected(limit)
         repaired = copies = nbytes = 0
         for h in todo:
@@ -271,15 +288,26 @@ def repair_pass(limit: int = 500) -> dict:
                 continue
             if r.get("copied"):
                 repaired += 1
-                copies += r["copied"]
+                copies += r["copies_made"] if "copies_made" in r else r["copied"]
                 nbytes += r["bytes"]
+        after = nodes.traffic().get("repair", {})
+        read = after.get("bytes_read", 0) - before.get("bytes_read", 0)
+        written = after.get("bytes_written", 0) - before.get("bytes_written", 0)
+        if repaired:
+            with pool.connection() as conn:
+                log_event(conn, "repair-job", None,
+                          f"rebuilt {repaired} chunks ({copies} copies/shards) after failure of "
+                          f"{', '.join(failed) or 'no node (scrub/other loss)'}: read {read} bytes, wrote {written} bytes "
+                          f"in {time.time() - started:.1f}s")
         run_gc()
-        return {"under_protected": len(todo), "chunks_repaired": repaired, "copies_rebuilt": copies, "bytes_written": nbytes}
+        return {"under_protected": len(todo), "chunks_repaired": repaired, "copies_rebuilt": copies,
+                "bytes_written": nbytes, "repair_traffic_read": read, "repair_traffic_written": written,
+                "seconds": round(time.time() - started, 2), "failed_nodes": failed}
     finally:
         _busy.release()
 
 
-def rebalance(execute: bool = True) -> dict:
+def _rebalance(execute: bool) -> dict:
     """Move only the copies whose ring owner changed. With execute=False just report the plan."""
     if not _busy.acquire(blocking=False):
         return {"skipped": "another maintenance pass is running"}

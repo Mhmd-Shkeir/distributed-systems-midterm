@@ -30,12 +30,12 @@ def manifest(key):
     return requests.get(f"{META}/admin/manifest/{B}/{key}").json()["chunks"]
 
 
-def all_readable(prefixes=("",)):
+def all_readable(prefixes=("",), consistency="quorum"):
     bad, degraded = [], 0
     for key, (data, _) in objs.items():
         if not key.startswith(tuple(prefixes)):
             continue
-        g = get(B, key)
+        g = get(B, key, headers={"X-DFS-Consistency": consistency})
         if g.status_code != 200 or g.content != data:
             bad.append(key)
         else:
@@ -61,8 +61,8 @@ print("storage overhead by durability:", {m["mode"]: m["overhead"] for m in admi
 # --- two of four nodes down at once: nothing is lost, reads are served degraded
 for n in ("node1", "node2"):
     docker("stop", container(n))
-bad, degraded = all_readable(("rep/", "ec22/"))  # both tolerate 2 lost nodes (3 copies / 2 parity shards)
-check("two nodes down: every 3x replicated and EC 2+2 object is still readable", not bad, str(bad))
+bad, degraded = all_readable(("rep/", "ec22/"), consistency="any")  # both tolerate 2 lost nodes (3 copies / 2 parity shards)
+check("two nodes down: every 3x replicated and EC 2+2 object is still readable (single-replica reads)", not bad, str(bad))
 check("... some chunks were served in degraded mode (failover or decoding)", degraded > 0, str(degraded))
 lost_ec21 = all_readable(("ec21/",))[0]
 print(f"EC 2+1 tolerates only 1 failure by design: {len(lost_ec21)} of 3 such objects unavailable while 2 nodes are down")
