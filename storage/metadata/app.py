@@ -7,6 +7,7 @@ Extra: /search, and /admin/* for cluster status, repair, scrub and rebalancing.
 """
 import asyncio
 import json
+from datetime import datetime
 import logging
 import random
 import re
@@ -14,19 +15,21 @@ import time
 from collections import Counter
 from contextlib import asynccontextmanager
 from email.utils import format_datetime
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from . import config, maintenance, nodes, store
+from . import config, maintenance, multipart, nodes, store
 from .db import init_schema, pool
 from .nodes import ring
 
 log = logging.getLogger("metadata")
 logging.basicConfig(level=logging.INFO)
 
-RESERVED = {"admin", "nodes", "heartbeat", "search", "docs", "redoc", "openapi.json"}
+RESERVED = {"admin", "nodes", "heartbeat", "search", "docs", "redoc", "openapi.json", "ui", "cluster"}
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 
 
@@ -111,6 +114,34 @@ def list_nodes():
 
 
 # ------------------------------------------------------------------ admin
+
+UI_FILE = Path(__file__).resolve().parent.parent / "ui" / "index.html"
+
+
+@app.get("/ui", response_class=HTMLResponse)
+def web_ui():
+    """The React web interface (single page, served by the gateway itself)."""
+    return HTMLResponse(UI_FILE.read_text(encoding="utf8"))
+
+
+@app.get("/cluster/status")
+def cluster_status():
+    """One call with everything a dashboard needs: node health, chunk distribution, repairs and storage figures."""
+    with pool.connection() as conn:
+        dist = {r["node_id"]: r for r in conn.execute(
+            "SELECT node_id, count(*) AS pieces, coalesce(sum(size),0)::bigint AS bytes FROM chunk_locations GROUP BY node_id").fetchall()}
+        modes = conn.execute("SELECT mode, count(*) AS chunks FROM chunks GROUP BY mode").fetchall()
+    node_list = list_nodes()
+    for n in node_list:
+        d = dist.get(n["node_id"], {"pieces": 0, "bytes": 0})
+        n["pieces"], n["stored_bytes"] = d["pieces"], d["bytes"]
+    st = admin_status()
+    return {"nodes": node_list, "chunks_by_durability": modes, "storage": stats(),
+            "under_protected_chunks": st["under_protected_chunks"], "failed_nodes": st["failed_nodes"],
+            "gc_queue": st["gc_queue"], "recent_repairs": admin_repairs(limit=15),
+            "config": {"replication_factor": config.REPLICATION_FACTOR, "write_quorum": config.WRITE_QUORUM,
+                       "read_quorum": config.READ_QUORUM, "ec": {"k": config.EC_K, "m": config.EC_M}}}
+
 
 @app.get("/admin/config")
 def admin_config():
@@ -286,10 +317,19 @@ def stats():
 
 @app.get("/search")
 def search(request: Request, q: str = "", bucket: str = "", prefix: str = "", min_size: int | None = None,
-           max_size: int | None = None, content_type: str = "", limit: int = Query(100, ge=1, le=10000)):
+           max_size: int | None = None, content_type: str = "", created_after: str = "", created_before: str = "",
+           limit: int = Query(100, ge=1, le=10000)):
     """Find objects by key/metadata text, size range, content type or exact user metadata (meta.<name>=<value>)."""
-    meta = {k[5:].lower(): v for k, v in request.query_params.items() if k.startswith("meta.")}
-    results = store.search_objects(q, bucket, prefix, min_size, max_size, content_type, meta, limit)
+    # user-defined tags: tag.<name>=<value> (meta.<name>=<value> is accepted as a synonym)
+    meta = {k.split(".", 1)[1].lower(): v for k, v in request.query_params.items() if k.startswith(("tag.", "meta."))}
+    for label, value in (("created_after", created_after), ("created_before", created_before)):
+        if value:
+            try:
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                raise HTTPException(400, f"{label} must be an ISO date, for example 2026-10-28 or 2026-10-28T09:00:00")
+    results = store.search_objects(q, bucket, prefix, min_size, max_size, content_type, meta, limit,
+                                   created_after or None, created_before or None)
     return {"count": len(results), "results": results}
 
 
@@ -398,6 +438,14 @@ async def put_object(
         raise HTTPException(413, "EntityTooLarge")
     if not data:
         raise HTTPException(400, "empty objects are not supported")
+    upload_id = request.query_params.get("uploadId")
+    if upload_id:  # one part of a multipart upload
+        part = request.query_params.get("partNumber")
+        if not part or not part.isdigit():
+            raise HTTPException(400, "partNumber is required")
+        etag = await run_in_threadpool(multipart.upload_part, bucket, key, upload_id, int(part), data)
+        return Response(content=json.dumps({"partNumber": int(part), "etag": etag}), media_type="application/json",
+                        headers={"ETag": f'"{etag}"'})
     d = await run_in_threadpool(store.resolve_durability, bucket, durability=durability, copies=copies,
                                 write_quorum=write_quorum, read_quorum=read_quorum, k=k, m=m)
     result = await run_in_threadpool(
@@ -468,7 +516,25 @@ def head_object(bucket: str, key: str):
                     headers={**object_headers(obj), "Content-Length": str(obj["size"])})
 
 
+@app.post("/{bucket}/{key:path}")
+def multipart_control(bucket: str, key: str, request: Request):
+    """POST ?uploads starts a multipart upload; POST ?uploadId=.. completes it."""
+    if "uploads" in request.query_params:
+        meta = user_meta(request)
+        uid = multipart.initiate(bucket, key, request.headers.get("content-type", "application/octet-stream"), meta)
+        return {"bucket": bucket, "key": key, "uploadId": uid}
+    upload_id = request.query_params.get("uploadId")
+    if upload_id:
+        result = multipart.complete(bucket, key, upload_id)
+        return Response(content=json.dumps(result), media_type="application/json", headers={"ETag": f'"{result["etag"]}"'})
+    raise HTTPException(400, "use ?uploads to start or ?uploadId=<id> to complete a multipart upload")
+
+
 @app.delete("/{bucket}/{key:path}", status_code=204)
-def delete_object(bucket: str, key: str):
+def delete_object(bucket: str, key: str, request: Request):
+    upload_id = request.query_params.get("uploadId")
+    if upload_id:  # abort a multipart upload and free its parts
+        multipart.abort(bucket, key, upload_id)
+        return Response(status_code=204)
     store.delete_object(bucket, key)  # S3 returns 204 even when the key does not exist
     return Response(status_code=204)

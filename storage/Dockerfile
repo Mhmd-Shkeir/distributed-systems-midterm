@@ -1,4 +1,6 @@
-FROM mirror.gcr.io/library/python:3.12-slim
+﻿# BASE can point at a previously built image so only new packages are downloaded (DFS_BASE=dfs-storage-node:latest)
+ARG BASE=mirror.gcr.io/library/python:3.12-slim
+FROM ${BASE}
 WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

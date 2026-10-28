@@ -329,7 +329,7 @@ def list_objects(bucket: str, prefix: str, delimiter: str, max_keys: int, token:
     """S3 ListObjectsV2: prefix filtering, delimiter roll-up into common prefixes, continuation tokens."""
     contents, prefixes = [], []
     after, truncated = token, False
-    base = ("FROM objects WHERE bucket=%s AND key LIKE %s ESCAPE '\' AND key COLLATE \"C\" > %s")
+    base = ("FROM objects WHERE bucket=%s AND key LIKE %s ESCAPE '\\' AND key COLLATE \"C\" > %s AND key NOT LIKE '.multipart/%%'")
     with pool.connection() as conn:
         if not conn.execute("SELECT 1 FROM buckets WHERE name=%s", (bucket,)).fetchone():
             raise HTTPException(404, f"NoSuchBucket: {bucket}")
@@ -376,8 +376,15 @@ def _just_before(s: str) -> str:
     return s[:-1] + chr(ord(s[-1]) - 1) + "􏿿"
 
 
-def search_objects(q: str, bucket: str, prefix: str, min_size, max_size, content_type: str, meta: dict, limit: int):
-    where, args = ["TRUE"], []
+def search_objects(q: str, bucket: str, prefix: str, min_size, max_size, content_type: str, meta: dict, limit: int,
+                   created_after=None, created_before=None):
+    where, args = ["key NOT LIKE '.multipart/%%'"], []
+    if created_after:
+        where.append("created_at >= %s")
+        args.append(created_after)
+    if created_before:
+        where.append("created_at < %s")
+        args.append(created_before)
     if bucket:
         where.append("bucket = %s")
         args.append(bucket)

@@ -35,6 +35,7 @@ CONFIGS = {
     "erasure coding 2+1": dict(durability="ec", k=2, m=1),
     "erasure coding 2+2": dict(durability="ec", k=2, m=2),
 }
+SHORT = {"rep3": "replication N=3 (W=2,R=2)", "ec21": "erasure coding 2+1", "ec22": "erasure coding 2+2"}
 _tls = threading.local()
 
 
@@ -203,7 +204,7 @@ def write_results(rows, out):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--workloads", default="small,large")
-    ap.add_argument("--durability", default=",".join(CONFIGS), help="comma separated: " + " | ".join(CONFIGS))
+    ap.add_argument("--durability", default="rep3,ec21,ec22", help="comma separated, any of: " + ", ".join(f"{k} = {v}" for k, v in SHORT.items()))
     ap.add_argument("--small-count", type=int, default=600)
     ap.add_argument("--large-count", type=int, help="use only the first N large files (8,12,16,24,32,40 MiB)")
     ap.add_argument("--small-workers", type=int, default=8)
@@ -219,7 +220,8 @@ def main():
     rows = []
     for wl in args.workloads.split(","):
         files = list(workload(wl, args.small_count if wl == "small" else args.large_count))
-        for cfg_name in args.durability.split(","):
+        for short in args.durability.split(","):
+            cfg_name = SHORT[short.strip()]
             rows.append(run_one(wl, files, cfg_name, CONFIGS[cfg_name], args))
             write_results(rows, args.out)  # keep partial results if the run is interrupted
     print("\n" + open(os.path.join(args.out, "benchmark_summary.md")).read())

@@ -98,12 +98,32 @@ CREATE TABLE repair_log (
 """
 
 
+EXTRA = """
+CREATE TABLE IF NOT EXISTS multipart_uploads (
+    upload_id    text PRIMARY KEY,
+    bucket       text NOT NULL,
+    key          text NOT NULL,
+    content_type text NOT NULL DEFAULT 'application/octet-stream',
+    meta         jsonb NOT NULL DEFAULT '{}',
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS multipart_parts (
+    upload_id   text NOT NULL REFERENCES multipart_uploads(upload_id) ON DELETE CASCADE,
+    part_number integer NOT NULL,
+    size        bigint NOT NULL,
+    etag        text NOT NULL,
+    PRIMARY KEY (upload_id, part_number)
+);
+"""
+
+
 def init_schema():
     """Create the schema; a different (older) version is dropped and recreated."""
     with pool.connection() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS schema_meta (version integer NOT NULL)")
         row = conn.execute("SELECT version FROM schema_meta").fetchone()
         if row and row["version"] == SCHEMA_VERSION:
+            conn.execute(EXTRA)
             return
         log.warning("creating schema version %d", SCHEMA_VERSION)
         for t in TABLES:
@@ -111,6 +131,7 @@ def init_schema():
         conn.execute(SCHEMA)
         conn.execute("DELETE FROM schema_meta")
         conn.execute("INSERT INTO schema_meta (version) VALUES (%s)", (SCHEMA_VERSION,))
+        conn.execute(EXTRA)
 
 
 def lock_keys(conn, keys):
